@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: bd-gestionbackups-cloud
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DEMO_TOKEN
+        generateValue: true
+      - key: INTERVAL_SECONDS
+        value: "60"
