@@ -44,23 +44,52 @@ function quoteIdent(value) {
   return '"' + String(value).replace(/"/g, '""') + '"';
 }
 
-function databaseUrlFor(databaseName) {
+function databaseUrlFor(databaseName, { direct = false } = {}) {
   const url = new URL(DATABASE_URL);
   url.pathname = '/' + encodeURIComponent(databaseName);
+
+  // Para crear/reconectar a una base recién creada evitamos PgBouncer.
+  // En Neon el endpoint pooled lleva el sufijo -pooler; el directo no.
+  if (direct && url.hostname.includes('-pooler.')) {
+    url.hostname = url.hostname.replace('-pooler.', '.');
+  }
   return url.toString();
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function withAppClient(fn) {
-  const client = new Client({
-    connectionString: databaseUrlFor(APP_DB_NAME),
-    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
-  });
-  await client.connect();
-  try {
-    return await fn(client);
-  } finally {
-    await client.end().catch(() => {});
+  let lastError;
+
+  // Una base recién creada puede tardar unos segundos en aceptar conexiones.
+  // Usamos endpoint directo y varios reintentos para evitar el error cacheado
+  // de PgBouncer: "database ... does not exist (server_login_retry)".
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const client = new Client({
+      connectionString: databaseUrlFor(APP_DB_NAME, { direct: true }),
+      ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000
+    });
+
+    try {
+      await client.connect();
+      try {
+        return await fn(client);
+      } finally {
+        await client.end().catch(() => {});
+      }
+    } catch (error) {
+      lastError = error;
+      await client.end().catch(() => {});
+      if (attempt < 8) {
+        await sleep(1500 * attempt);
+      }
+    }
   }
+
+  throw lastError;
 }
 
 async function ensureControlTables(client) {
@@ -180,6 +209,8 @@ async function restoreBackup(controlClient) {
   const created = await createDatabase(controlClient);
   if (created) {
     await writeEvent(controlClient, 'CREACION', `Base ${APP_DB_NAME} recreada en Neon.`);
+    // Da tiempo a Neon para registrar la nueva base antes de abrir la primera conexión.
+    await sleep(2000);
   }
 
   const contenido = backup.rows[0].contenido || {};

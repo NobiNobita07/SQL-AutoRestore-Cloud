@@ -27,3 +27,7 @@ El botón **Eliminar base real (prueba)** guarda primero el backup actual y lueg
 7. El frontend vuelve a mostrar los clientes restaurados.
 
 > No elimines `neondb`: ahí vive la copia de seguridad que permite recrear la base de demostración.
+
+
+## Corrección de reconexión
+La conexión a `bd_gestionbackups` usa el endpoint directo de Neon y reintentos después de recrear la base, evitando el error temporal de PgBouncer `server_login_retry`.
