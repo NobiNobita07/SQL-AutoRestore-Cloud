@@ -13,15 +13,20 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// DATABASE_URL apunta a neondb. Esa base queda como "base de control":
-// guarda el backup y los eventos, mientras APP_DB_NAME sí se elimina y recrea.
+// DATABASE_URL apunta a neondb.
+// Esa base queda como base de control:
+// guarda el backup y los eventos.
+// APP_DB_NAME es la base real que se elimina y restaura.
 const controlPool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  ssl: DATABASE_URL.includes('localhost')
+    ? false
+    : { rejectUnauthorized: false },
   max: 5
 });
 
 const app = express();
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -46,13 +51,18 @@ function quoteIdent(value) {
 
 function databaseUrlFor(databaseName, { direct = false } = {}) {
   const url = new URL(DATABASE_URL);
+
   url.pathname = '/' + encodeURIComponent(databaseName);
 
-  // Para crear/reconectar a una base recién creada evitamos PgBouncer.
-  // En Neon el endpoint pooled lleva el sufijo -pooler; el directo no.
+  // Para crear/reconectar a una base recién creada
+  // evitamos PgBouncer.
+  //
+  // En Neon el endpoint pooled contiene "-pooler".
+  // El endpoint directo no.
   if (direct && url.hostname.includes('-pooler.')) {
     url.hostname = url.hostname.replace('-pooler.', '.');
   }
+
   return url.toString();
 }
 
@@ -63,27 +73,43 @@ function sleep(ms) {
 async function withAppClient(fn) {
   let lastError;
 
-  // Una base recién creada puede tardar unos segundos en aceptar conexiones.
-  // Usamos endpoint directo y varios reintentos para evitar el error cacheado
-  // de PgBouncer: "database ... does not exist (server_login_retry)".
+  // Neon puede tardar unos segundos en aceptar conexiones
+  // después de CREATE DATABASE.
+  //
+  // Usamos conexión directa y varios reintentos.
   for (let attempt = 1; attempt <= 8; attempt++) {
     const client = new Client({
-      connectionString: databaseUrlFor(APP_DB_NAME, { direct: true }),
-      ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+      connectionString: databaseUrlFor(
+        APP_DB_NAME,
+        { direct: true }
+      ),
+
+      ssl: DATABASE_URL.includes('localhost')
+        ? false
+        : { rejectUnauthorized: false },
+
       connectionTimeoutMillis: 10000
     });
 
     try {
       await client.connect();
+
       try {
         return await fn(client);
       } finally {
         await client.end().catch(() => {});
       }
+
     } catch (error) {
       lastError = error;
+
       await client.end().catch(() => {});
+
       if (attempt < 8) {
+        console.log(
+          `Intento ${attempt} fallido conectando a ${APP_DB_NAME}. Reintentando...`
+        );
+
         await sleep(1500 * attempt);
       }
     }
@@ -99,6 +125,7 @@ async function ensureControlTables(client) {
       contenido jsonb NOT NULL,
       actualizado_en timestamptz NOT NULL DEFAULT now()
     );
+
     CREATE TABLE IF NOT EXISTS cloud_events (
       evento_id bigserial PRIMARY KEY,
       tipo varchar(30) NOT NULL,
@@ -110,21 +137,44 @@ async function ensureControlTables(client) {
 
 async function databaseExists(controlClient) {
   const result = await controlClient.query(
-    'SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS existe',
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM pg_database
+        WHERE datname = $1
+      ) AS existe
+    `,
     [APP_DB_NAME]
   );
+
   return result.rows[0].existe;
 }
 
 async function createDatabase(controlClient) {
-  if (await databaseExists(controlClient)) return false;
-  await controlClient.query(`CREATE DATABASE ${quoteIdent(APP_DB_NAME)}`);
+  if (await databaseExists(controlClient)) {
+    return false;
+  }
+
+  console.log(`Creando base ${APP_DB_NAME}...`);
+
+  await controlClient.query(
+    `CREATE DATABASE ${quoteIdent(APP_DB_NAME)}`
+  );
+
   return true;
 }
 
 async function dropDatabase(controlClient) {
-  if (!(await databaseExists(controlClient))) return false;
-  await controlClient.query(`DROP DATABASE ${quoteIdent(APP_DB_NAME)} WITH (FORCE)`);
+  if (!(await databaseExists(controlClient))) {
+    return false;
+  }
+
+  console.log(`Eliminando base real ${APP_DB_NAME}...`);
+
+  await controlClient.query(
+    `DROP DATABASE ${quoteIdent(APP_DB_NAME)} WITH (FORCE)`
+  );
+
   return true;
 }
 
@@ -142,11 +192,15 @@ async function ensureApplicationTable(appClient) {
 async function applicationTableExists() {
   try {
     return await withAppClient(async client => {
-      const result = await client.query(
-        "SELECT to_regclass('public.cliente') IS NOT NULL AS existe"
-      );
+      const result = await client.query(`
+        SELECT
+          to_regclass('public.cliente') IS NOT NULL
+          AS existe
+      `);
+
       return result.rows[0].existe;
     });
+
   } catch (_error) {
     return false;
   }
@@ -154,24 +208,122 @@ async function applicationTableExists() {
 
 async function writeEvent(client, tipo, mensaje) {
   await client.query(
-    'INSERT INTO cloud_events(tipo, mensaje) VALUES ($1, $2)',
-    [tipo, mensaje]
+    `
+      INSERT INTO cloud_events(
+        tipo,
+        mensaje
+      )
+      VALUES ($1, $2)
+    `,
+    [
+      tipo,
+      mensaje
+    ]
   );
 }
 
+/*
+==========================================================
+BACKUP
+==========================================================
+
+Esta versión protege el último backup válido.
+
+Si la base tiene 0 clientes pero cloud_backup ya
+contiene clientes, NO se sobrescribe el backup.
+
+Esto evita que una base temporalmente vacía destruya
+el último respaldo bueno.
+==========================================================
+*/
+
 async function makeBackup(controlClient) {
   if (!(await databaseExists(controlClient))) {
-    throw new Error(`La base ${APP_DB_NAME} no existe; no se puede generar el backup.`);
+    throw new Error(
+      `La base ${APP_DB_NAME} no existe; no se puede generar el backup.`
+    );
   }
 
   const rows = await withAppClient(async appClient => {
     await ensureApplicationTable(appClient);
+
     return appClient.query(`
-      SELECT cliente_id, nombres, correo, fecha_registro
+      SELECT
+        cliente_id,
+        nombres,
+        correo,
+        fecha_registro
       FROM cliente
       ORDER BY cliente_id
     `);
   });
+
+  /*
+  ========================================================
+  PROTECCIÓN CONTRA BACKUP VACÍO
+  ========================================================
+  */
+
+  if (rows.rowCount === 0) {
+
+    const backupActual = await controlClient.query(`
+      SELECT contenido
+      FROM cloud_backup
+      WHERE backup_id = 1
+    `);
+
+    let clientesGuardados = 0;
+
+    if (
+      backupActual.rowCount > 0 &&
+      backupActual.rows[0].contenido &&
+      Array.isArray(
+        backupActual.rows[0].contenido.clientes
+      )
+    ) {
+      clientesGuardados =
+        backupActual.rows[0]
+          .contenido
+          .clientes
+          .length;
+    }
+
+    /*
+    Si ya tenemos un backup válido con clientes,
+    NO lo reemplazamos por uno vacío.
+    */
+
+    if (clientesGuardados > 0) {
+
+      console.log(
+        `Backup omitido: la base está vacía y ` +
+        `cloud_backup conserva ${clientesGuardados} registros.`
+      );
+
+      await writeEvent(
+        controlClient,
+        'BACKUP_OMITIDO',
+        `No se sobrescribió la copia: ${APP_DB_NAME} ` +
+        `tiene 0 registros y el backup conserva ` +
+        `${clientesGuardados}.`
+      );
+
+      runtime.estado = 'OK';
+
+      runtime.mensaje =
+        `Base activa pero vacía. ` +
+        `Se conserva el backup anterior con ` +
+        `${clientesGuardados} registros.`;
+
+      return;
+    }
+  }
+
+  /*
+  ========================================================
+  CREAR CONTENIDO DEL BACKUP
+  ========================================================
+  */
 
   const contenido = {
     version: 2,
@@ -179,261 +331,910 @@ async function makeBackup(controlClient) {
     clientes: rows.rows
   };
 
-  await controlClient.query(`
-    INSERT INTO cloud_backup(backup_id, contenido, actualizado_en)
-    VALUES (1, $1::jsonb, now())
-    ON CONFLICT (backup_id)
-    DO UPDATE SET contenido = EXCLUDED.contenido, actualizado_en = now()
-  `, [JSON.stringify(contenido)]);
+  /*
+  ========================================================
+  BACKUP ÚNICO
+  ========================================================
+
+  backup_id siempre es 1.
+
+  Si ya existe:
+  se sobrescribe.
+
+  Si no existe:
+  se crea.
+
+  ========================================================
+  */
+
+  await controlClient.query(
+    `
+      INSERT INTO cloud_backup(
+        backup_id,
+        contenido,
+        actualizado_en
+      )
+      VALUES (
+        1,
+        $1::jsonb,
+        now()
+      )
+
+      ON CONFLICT (backup_id)
+
+      DO UPDATE SET
+        contenido = EXCLUDED.contenido,
+        actualizado_en = now()
+    `,
+    [
+      JSON.stringify(contenido)
+    ]
+  );
 
   await writeEvent(
     controlClient,
     'BACKUP',
-    `Copia lógica sobrescrita de ${APP_DB_NAME} (${rows.rowCount} registros).`
+    `Copia lógica sobrescrita de ${APP_DB_NAME} ` +
+    `(${rows.rowCount} registros).`
   );
 
-  runtime.ultimoBackup = new Date().toISOString();
+  runtime.ultimoBackup =
+    new Date().toISOString();
+
   runtime.estado = 'OK';
-  runtime.mensaje = 'Copia única actualizada desde la base real de Neon.';
+
+  runtime.mensaje =
+    'Copia única actualizada desde la base real de Neon.';
+
+  console.log(
+    `Backup actualizado: ${rows.rowCount} registros.`
+  );
 }
 
+/*
+==========================================================
+RESTAURACIÓN
+==========================================================
+*/
+
 async function restoreBackup(controlClient) {
-  const backup = await controlClient.query(
-    'SELECT contenido FROM cloud_backup WHERE backup_id = 1'
-  );
-  if (!backup.rowCount) throw new Error('No existe una copia lógica para restaurar.');
+  const backup = await controlClient.query(`
+    SELECT contenido
+    FROM cloud_backup
+    WHERE backup_id = 1
+  `);
 
-  runtime.estado = 'RESTAURANDO';
-  runtime.mensaje = `Recreando ${APP_DB_NAME} en Neon...`;
+  if (!backup.rowCount) {
+    throw new Error(
+      'No existe una copia lógica para restaurar.'
+    );
+  }
 
-  const created = await createDatabase(controlClient);
+  const contenido =
+    backup.rows[0].contenido || {};
+
+  const clientesBackup =
+    Array.isArray(contenido.clientes)
+      ? contenido.clientes
+      : [];
+
+  runtime.estado =
+    'RESTAURANDO';
+
+  runtime.mensaje =
+    `Recreando ${APP_DB_NAME} en Neon...`;
+
+  /*
+  ========================================================
+  CREAR NUEVAMENTE LA BASE
+  ========================================================
+  */
+
+  const created =
+    await createDatabase(controlClient);
+
   if (created) {
-    await writeEvent(controlClient, 'CREACION', `Base ${APP_DB_NAME} recreada en Neon.`);
-    // Da tiempo a Neon para registrar la nueva base antes de abrir la primera conexión.
+    await writeEvent(
+      controlClient,
+      'CREACION',
+      `Base ${APP_DB_NAME} recreada en Neon.`
+    );
+
+    /*
+    Neon puede necesitar unos segundos
+    para registrar la nueva base.
+    */
+
     await sleep(2000);
   }
 
-  const contenido = backup.rows[0].contenido || {};
-  await withAppClient(async appClient => {
-    await ensureApplicationTable(appClient);
-    await appClient.query('TRUNCATE TABLE cliente RESTART IDENTITY');
+  /*
+  ========================================================
+  RESTAURAR TABLA Y DATOS
+  ========================================================
+  */
 
-    for (const row of contenido.clientes || []) {
+  await withAppClient(
+    async appClient => {
+
+      await ensureApplicationTable(
+        appClient
+      );
+
       await appClient.query(`
-        INSERT INTO cliente (cliente_id, nombres, correo, fecha_registro)
-        VALUES ($1, $2, $3, $4)
-      `, [row.cliente_id, row.nombres, row.correo, row.fecha_registro]);
-    }
+        TRUNCATE TABLE cliente
+        RESTART IDENTITY
+      `);
 
-    await appClient.query(`
-      SELECT setval(
-        pg_get_serial_sequence('cliente', 'cliente_id'),
-        COALESCE((SELECT MAX(cliente_id) FROM cliente), 1),
-        EXISTS (SELECT 1 FROM cliente)
-      )
-    `);
-  });
+      for (
+        const row
+        of clientesBackup
+      ) {
+
+        await appClient.query(
+          `
+            INSERT INTO cliente (
+              cliente_id,
+              nombres,
+              correo,
+              fecha_registro
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              $4
+            )
+          `,
+          [
+            row.cliente_id,
+            row.nombres,
+            row.correo,
+            row.fecha_registro
+          ]
+        );
+      }
+
+      /*
+      Ajustar la secuencia después
+      de insertar IDs manualmente.
+      */
+
+      await appClient.query(`
+        SELECT setval(
+          pg_get_serial_sequence(
+            'cliente',
+            'cliente_id'
+          ),
+
+          COALESCE(
+            (
+              SELECT MAX(cliente_id)
+              FROM cliente
+            ),
+            1
+          ),
+
+          EXISTS (
+            SELECT 1
+            FROM cliente
+          )
+        )
+      `);
+    }
+  );
 
   await writeEvent(
     controlClient,
     'RESTAURACION',
-    `Base ${APP_DB_NAME} restaurada automáticamente desde cloud_backup.`
+    `Base ${APP_DB_NAME} restaurada automáticamente ` +
+    `desde cloud_backup (${clientesBackup.length} registros).`
   );
 
-  runtime.ultimaRestauracion = new Date().toISOString();
-  runtime.estado = 'RESTAURADA';
-  runtime.mensaje = 'La base real reapareció en Neon y sus datos fueron restaurados.';
+  runtime.ultimaRestauracion =
+    new Date().toISOString();
+
+  runtime.estado =
+    'RESTAURADA';
+
+  runtime.mensaje =
+    `La base real reapareció en Neon y ` +
+    `${clientesBackup.length} registros fueron restaurados.`;
+
+  console.log(
+    `Restauración completada: ` +
+    `${clientesBackup.length} registros.`
+  );
 }
 
-async function seedNewDatabase(controlClient) {
-  await createDatabase(controlClient);
-  await withAppClient(async appClient => {
-    await ensureApplicationTable(appClient);
-    const count = Number((await appClient.query('SELECT COUNT(*)::int AS total FROM cliente')).rows[0].total);
-    if (count === 0) {
-      for (const [name, email] of SAMPLE_CLIENTS) {
-        await appClient.query(
-          'INSERT INTO cliente(nombres, correo) VALUES ($1, $2)',
-          [name, email]
-        );
+/*
+==========================================================
+CREAR BASE INICIAL
+==========================================================
+*/
+
+async function seedNewDatabase(
+  controlClient
+) {
+  await createDatabase(
+    controlClient
+  );
+
+  await withAppClient(
+    async appClient => {
+
+      await ensureApplicationTable(
+        appClient
+      );
+
+      const count = Number(
+        (
+          await appClient.query(`
+            SELECT COUNT(*)::int
+            AS total
+            FROM cliente
+          `)
+        ).rows[0].total
+      );
+
+      if (count === 0) {
+
+        for (
+          const [name, email]
+          of SAMPLE_CLIENTS
+        ) {
+
+          await appClient.query(
+            `
+              INSERT INTO cliente(
+                nombres,
+                correo
+              )
+              VALUES ($1, $2)
+            `,
+            [
+              name,
+              email
+            ]
+          );
+        }
       }
     }
-  });
-  await makeBackup(controlClient);
-  await writeEvent(controlClient, 'INICIO', `Base real ${APP_DB_NAME} creada con datos de demostración.`);
+  );
+
+  await makeBackup(
+    controlClient
+  );
+
+  await writeEvent(
+    controlClient,
+    'INICIO',
+    `Base real ${APP_DB_NAME} ` +
+    `creada con datos de demostración.`
+  );
 }
+
+/*
+==========================================================
+INICIALIZACIÓN
+==========================================================
+*/
 
 async function initialize() {
-  const controlClient = await controlPool.connect();
-  try {
-    await ensureControlTables(controlClient);
-    const hasBackup = (await controlClient.query('SELECT 1 FROM cloud_backup WHERE backup_id = 1')).rowCount > 0;
-    const dbExists = await databaseExists(controlClient);
+  const controlClient =
+    await controlPool.connect();
 
-    if (!dbExists && hasBackup) {
-      await restoreBackup(controlClient);
+  try {
+
+    await ensureControlTables(
+      controlClient
+    );
+
+    const hasBackup =
+      (
+        await controlClient.query(`
+          SELECT 1
+          FROM cloud_backup
+          WHERE backup_id = 1
+        `)
+      ).rowCount > 0;
+
+    const dbExists =
+      await databaseExists(
+        controlClient
+      );
+
+    /*
+    La base fue borrada
+    pero existe backup.
+    */
+
+    if (
+      !dbExists &&
+      hasBackup
+    ) {
+      await restoreBackup(
+        controlClient
+      );
+
       return;
     }
+
+    /*
+    No existe la base
+    ni tampoco backup.
+    */
 
     if (!dbExists) {
-      await seedNewDatabase(controlClient);
+      await seedNewDatabase(
+        controlClient
+      );
+
       return;
     }
 
-    const tableExists = await applicationTableExists();
-    if (!tableExists && hasBackup) {
-      await restoreBackup(controlClient);
-    } else if (!tableExists) {
-      await withAppClient(ensureApplicationTable);
-      await makeBackup(controlClient);
-    } else if (!hasBackup) {
-      await makeBackup(controlClient);
+    const tableExists =
+      await applicationTableExists();
+
+    /*
+    Existe la base,
+    pero falta cliente.
+    */
+
+    if (
+      !tableExists &&
+      hasBackup
+    ) {
+
+      await restoreBackup(
+        controlClient
+      );
+
+    } else if (
+      !tableExists
+    ) {
+
+      await withAppClient(
+        ensureApplicationTable
+      );
+
+      await makeBackup(
+        controlClient
+      );
+
+    } else if (
+      !hasBackup
+    ) {
+
+      await makeBackup(
+        controlClient
+      );
+
     } else {
-      runtime.estado = 'OK';
-      runtime.mensaje = 'Base real activa en Neon.';
+
+      runtime.estado =
+        'OK';
+
+      runtime.mensaje =
+        'Base real activa en Neon.';
     }
+
   } finally {
     controlClient.release();
   }
 }
+
+/*
+==========================================================
+CICLO AUTOMÁTICO
+==========================================================
+*/
 
 async function runCycle() {
-  if (runtime.ocupado) return;
-  runtime.ocupado = true;
-  const controlClient = await controlPool.connect();
+  if (runtime.ocupado) {
+    return;
+  }
+
+  runtime.ocupado =
+    true;
+
+  const controlClient =
+    await controlPool.connect();
+
   try {
-    await ensureControlTables(controlClient);
-    if (await databaseExists(controlClient)) {
-      runtime.estado = 'BACKUP';
-      runtime.mensaje = 'Sobrescribiendo la copia lógica única...';
-      await makeBackup(controlClient);
+
+    await ensureControlTables(
+      controlClient
+    );
+
+    /*
+    Si la base existe:
+    hacemos backup.
+    */
+
+    if (
+      await databaseExists(
+        controlClient
+      )
+    ) {
+
+      runtime.estado =
+        'BACKUP';
+
+      runtime.mensaje =
+        'Actualizando la copia lógica única...';
+
+      await makeBackup(
+        controlClient
+      );
+
     } else {
-      runtime.estado = 'RESTAURANDO';
-      runtime.mensaje = `La base ${APP_DB_NAME} fue eliminada. Restaurando...`;
-      await restoreBackup(controlClient);
+
+      /*
+      Si la base ya no existe:
+      restauramos desde neondb.
+      */
+
+      runtime.estado =
+        'RESTAURANDO';
+
+      runtime.mensaje =
+        `La base ${APP_DB_NAME} fue eliminada. Restaurando...`;
+
+      await restoreBackup(
+        controlClient
+      );
     }
+
   } catch (error) {
-    runtime.estado = 'ERROR';
-    runtime.mensaje = error.message;
-    console.error(error);
+
+    runtime.estado =
+      'ERROR';
+
+    runtime.mensaje =
+      error.message;
+
+    console.error(
+      'Error en ciclo:',
+      error
+    );
+
   } finally {
-    runtime.proximaEjecucion = new Date(Date.now() + INTERVAL_SECONDS * 1000).toISOString();
-    runtime.ocupado = false;
+
+    runtime.proximaEjecucion =
+      new Date(
+        Date.now() +
+        INTERVAL_SECONDS * 1000
+      ).toISOString();
+
+    runtime.ocupado =
+      false;
+
     controlClient.release();
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+/*
+==========================================================
+API HEALTH
+==========================================================
+*/
 
-app.get('/api/data', async (_req, res) => {
-  const controlClient = await controlPool.connect();
-  try {
-    await ensureControlTables(controlClient);
-    const dbExiste = await databaseExists(controlClient);
-    let clientes = [];
-
-    if (dbExiste) {
-      try {
-        clientes = await withAppClient(async appClient => {
-          const table = await appClient.query(
-            "SELECT to_regclass('public.cliente') IS NOT NULL AS existe"
-          );
-          if (!table.rows[0].existe) return { rows: [] };
-          return appClient.query(`
-            SELECT cliente_id, nombres, correo,
-                   to_char(fecha_registro AT TIME ZONE 'America/Lima', 'YYYY-MM-DD HH24:MI:SS') AS fecha_registro
-            FROM cliente ORDER BY cliente_id
-          `);
-        }).then(r => r.rows);
-      } catch (error) {
-        console.error('No se pudo leer la base de aplicación:', error.message);
-      }
-    }
-
-    const backup = await controlClient.query(
-      'SELECT actualizado_en FROM cloud_backup WHERE backup_id = 1'
-    );
-    const events = await controlClient.query(`
-      SELECT tipo, mensaje,
-             to_char(creado_en AT TIME ZONE 'America/Lima', 'YYYY-MM-DD HH24:MI:SS') AS fecha
-      FROM cloud_events ORDER BY evento_id DESC LIMIT 10
-    `);
+app.get(
+  '/api/health',
+  (_req, res) => {
 
     res.json({
-      dbExiste,
-      databaseName: APP_DB_NAME,
-      clientes,
-      estado: {
-        ...runtime,
-        intervaloSegundos: INTERVAL_SECONDS,
-        rutaBackup: 'Neon PostgreSQL · neondb.cloud_backup · registro único',
-        ultimoBackup: backup.rowCount ? backup.rows[0].actualizado_en : runtime.ultimoBackup
-      },
-      eventos: events.rows,
-      consultaHora: new Date().toISOString()
+      ok: true
     });
-  } catch (error) {
-    res.status(500).json({ dbExiste: false, clientes: [], estado: runtime, error: error.message });
-  } finally {
-    controlClient.release();
-  }
-});
 
-app.post('/api/demo/delete', async (req, res) => {
-  if (!DEMO_TOKEN) {
-    return res.status(503).json({ error: 'Configura DEMO_TOKEN en Render antes de usar la prueba.' });
   }
-  if (req.get('x-demo-token') !== DEMO_TOKEN) {
-    return res.status(401).json({ error: 'Clave de demostración incorrecta.' });
+);
+
+/*
+==========================================================
+API DATA
+==========================================================
+*/
+
+app.get(
+  '/api/data',
+  async (_req, res) => {
+
+    const controlClient =
+      await controlPool.connect();
+
+    try {
+
+      await ensureControlTables(
+        controlClient
+      );
+
+      const dbExiste =
+        await databaseExists(
+          controlClient
+        );
+
+      let clientes = [];
+
+      /*
+      Si la base existe,
+      intentar leer los clientes.
+      */
+
+      if (dbExiste) {
+
+        try {
+
+          clientes =
+            await withAppClient(
+              async appClient => {
+
+                const table =
+                  await appClient.query(`
+                    SELECT
+                      to_regclass(
+                        'public.cliente'
+                      ) IS NOT NULL
+                      AS existe
+                  `);
+
+                if (
+                  !table.rows[0].existe
+                ) {
+                  return {
+                    rows: []
+                  };
+                }
+
+                return appClient.query(`
+                  SELECT
+                    cliente_id,
+                    nombres,
+                    correo,
+
+                    to_char(
+                      fecha_registro
+                      AT TIME ZONE
+                      'America/Lima',
+
+                      'YYYY-MM-DD HH24:MI:SS'
+                    ) AS fecha_registro
+
+                  FROM cliente
+
+                  ORDER BY cliente_id
+                `);
+              }
+            ).then(
+              result =>
+                result.rows
+            );
+
+        } catch (error) {
+
+          console.error(
+            'No se pudo leer la base de aplicación:',
+            error.message
+          );
+        }
+      }
+
+      /*
+      Información del backup.
+      */
+
+      const backup =
+        await controlClient.query(`
+          SELECT
+            actualizado_en,
+            contenido
+          FROM cloud_backup
+          WHERE backup_id = 1
+        `);
+
+      let registrosBackup = 0;
+
+      if (
+        backup.rowCount &&
+        backup.rows[0].contenido &&
+        Array.isArray(
+          backup.rows[0]
+            .contenido
+            .clientes
+        )
+      ) {
+        registrosBackup =
+          backup.rows[0]
+            .contenido
+            .clientes
+            .length;
+      }
+
+      /*
+      Eventos recientes.
+      */
+
+      const events =
+        await controlClient.query(`
+          SELECT
+            tipo,
+            mensaje,
+
+            to_char(
+              creado_en
+              AT TIME ZONE
+              'America/Lima',
+
+              'YYYY-MM-DD HH24:MI:SS'
+            ) AS fecha
+
+          FROM cloud_events
+
+          ORDER BY evento_id DESC
+
+          LIMIT 10
+        `);
+
+      res.json({
+        dbExiste,
+
+        databaseName:
+          APP_DB_NAME,
+
+        clientes,
+
+        registrosBackup,
+
+        estado: {
+          ...runtime,
+
+          intervaloSegundos:
+            INTERVAL_SECONDS,
+
+          rutaBackup:
+            'Neon PostgreSQL · neondb.cloud_backup · registro único',
+
+          ultimoBackup:
+            backup.rowCount
+              ? backup.rows[0]
+                  .actualizado_en
+              : runtime.ultimoBackup
+        },
+
+        eventos:
+          events.rows,
+
+        consultaHora:
+          new Date().toISOString()
+      });
+
+    } catch (error) {
+
+      console.error(
+        'Error /api/data:',
+        error
+      );
+
+      res.status(500).json({
+        dbExiste: false,
+        clientes: [],
+        estado: runtime,
+        error: error.message
+      });
+
+    } finally {
+      controlClient.release();
+    }
   }
+);
 
-  const controlClient = await controlPool.connect();
-  try {
-    await ensureControlTables(controlClient);
+/*
+==========================================================
+ELIMINAR BASE REAL
+==========================================================
+*/
 
-    // Antes de destruir la base real, conserva la versión más reciente en neondb.
-    if (await databaseExists(controlClient)) {
-      await makeBackup(controlClient);
-      await dropDatabase(controlClient);
+app.post(
+  '/api/demo/delete',
+  async (req, res) => {
+
+    /*
+    DEMO_TOKEN obligatorio.
+    */
+
+    if (!DEMO_TOKEN) {
+      return res.status(503).json({
+        error:
+          'Configura DEMO_TOKEN en Render antes de usar la prueba.'
+      });
     }
 
-    await writeEvent(controlClient, 'ELIMINACION', `Se eliminó la base real ${APP_DB_NAME} de Neon.`);
-    runtime.estado = 'ELIMINADA';
-    runtime.mensaje = `La base ${APP_DB_NAME} ya no existe. Esperando restauración automática.`;
+    if (
+      req.get('x-demo-token') !==
+      DEMO_TOKEN
+    ) {
+      return res.status(401).json({
+        error:
+          'Clave de demostración incorrecta.'
+      });
+    }
+
+    const controlClient =
+      await controlPool.connect();
+
+    try {
+
+      await ensureControlTables(
+        controlClient
+      );
+
+      /*
+      Antes de borrar la base real,
+      hacemos un último backup.
+      */
+
+      if (
+        await databaseExists(
+          controlClient
+        )
+      ) {
+
+        await makeBackup(
+          controlClient
+        );
+
+        await dropDatabase(
+          controlClient
+        );
+      }
+
+      await writeEvent(
+        controlClient,
+        'ELIMINACION',
+        `Se eliminó la base real ${APP_DB_NAME} de Neon.`
+      );
+
+      runtime.estado =
+        'ELIMINADA';
+
+      runtime.mensaje =
+        `La base ${APP_DB_NAME} ya no existe. ` +
+        `Esperando restauración automática.`;
+
+      res.json({
+        ok: true,
+
+        message:
+          `Base real ${APP_DB_NAME} eliminada de Neon. ` +
+          `Se restaurará en el siguiente ciclo.`
+      });
+
+    } catch (error) {
+
+      runtime.estado =
+        'ERROR';
+
+      runtime.mensaje =
+        error.message;
+
+      console.error(
+        'Error eliminando base:',
+        error
+      );
+
+      res.status(500).json({
+        error:
+          error.message
+      });
+
+    } finally {
+      controlClient.release();
+    }
+  }
+);
+
+/*
+==========================================================
+EJECUTAR CICLO MANUAL
+==========================================================
+*/
+
+app.post(
+  '/api/demo/cycle',
+  async (req, res) => {
+
+    if (
+      !DEMO_TOKEN ||
+      req.get('x-demo-token') !==
+      DEMO_TOKEN
+    ) {
+
+      return res.status(401).json({
+        error:
+          'Clave de demostración incorrecta.'
+      });
+    }
+
+    await runCycle();
 
     res.json({
       ok: true,
-      message: `Base real ${APP_DB_NAME} eliminada de Neon. Se restaurará en el siguiente ciclo.`
+      estado: runtime.estado
     });
-  } catch (error) {
-    runtime.estado = 'ERROR';
-    runtime.mensaje = error.message;
-    res.status(500).json({ error: error.message });
-  } finally {
-    controlClient.release();
   }
-});
+);
 
-app.post('/api/demo/cycle', async (req, res) => {
-  if (!DEMO_TOKEN || req.get('x-demo-token') !== DEMO_TOKEN) {
-    return res.status(401).json({ error: 'Clave de demostración incorrecta.' });
-  }
-  await runCycle();
-  res.json({ ok: true, estado: runtime.estado });
-});
+/*
+==========================================================
+INICIAR SERVICIO
+==========================================================
+*/
 
 async function start() {
+
   await initialize();
-  runtime.proximaEjecucion = new Date(Date.now() + INTERVAL_SECONDS * 1000).toISOString();
-  setInterval(runCycle, INTERVAL_SECONDS * 1000);
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Aplicación disponible en el puerto ${PORT}`);
-    console.log(`Base de control: ${new URL(DATABASE_URL).pathname.replace(/^\//, '')}`);
-    console.log(`Base real protegida: ${APP_DB_NAME}`);
-  });
+
+  runtime.proximaEjecucion =
+    new Date(
+      Date.now() +
+      INTERVAL_SECONDS * 1000
+    ).toISOString();
+
+  /*
+  Ciclo automático.
+  */
+
+  setInterval(
+    runCycle,
+    INTERVAL_SECONDS * 1000
+  );
+
+  app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+
+      console.log(
+        `Aplicación disponible en el puerto ${PORT}`
+      );
+
+      console.log(
+        `Base de control: ${
+          new URL(
+            DATABASE_URL
+          ).pathname.replace(
+            /^\//,
+            ''
+          )
+        }`
+      );
+
+      console.log(
+        `Base real protegida: ${APP_DB_NAME}`
+      );
+
+      console.log(
+        `Intervalo automático: ${INTERVAL_SECONDS} segundos`
+      );
+    }
+  );
 }
 
-start().catch(error => {
-  console.error('No se pudo iniciar:', error);
-  process.exit(1);
-});
+/*
+==========================================================
+ARRANQUE
+==========================================================
+*/
+
+start().catch(
+  error => {
+
+    console.error(
+      'No se pudo iniciar:',
+      error
+    );
+
+    process.exit(1);
+  }
+);
